@@ -111,12 +111,31 @@ Goal: users reach the app only through `https://<lb-dns>`; the load balancer ter
    Each VM answers `/whoami` with its hostname and adds an `X-Served-By` header, so you can see which VM served each request.
 2. **Get a TLS certificate**
    - With a domain: AWS ACM / GCP managed certificate (free, DNS validation).
-   - Without a domain (lab only): generate a self-signed certificate and import it (ACM import / GCP self-managed SSL certificate):
+   - Without a domain (lab only): generate a self-signed certificate and import it (ACM import / GCP self-managed SSL certificate).
+     ACM only accepts an **RSA 2048** certificate (X.509 v3, with a SAN) and an **unencrypted PKCS#1 private key** (`-----BEGIN RSA PRIVATE KEY-----`).
+     OpenSSL 3.x (default on recent macOS/Linux) writes PKCS#8 (`-----BEGIN PRIVATE KEY-----`), which the load balancer rejects, so convert it:
      ```bash
      openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
-       -keyout lb.key -out lb.crt -subj "/CN=lab-lb"
+       -keyout lb.pkcs8.key -out lb.crt \
+       -subj "/CN=lab-lb.example.com" \
+       -addext "subjectAltName=DNS:lab-lb.example.com" \
+       -addext "basicConstraints=critical,CA:FALSE" \
+       -addext "keyUsage=digitalSignature,keyEncipherment" \
+       -addext "extendedKeyUsage=serverAuth"
+
+     # PKCS#8 -> PKCS#1 (the format ACM expects)
+     openssl rsa -in lb.pkcs8.key -traditional -out lb.key
+
+     head -1 lb.key        # must print: -----BEGIN RSA PRIVATE KEY-----
      ```
-     Never commit `lb.key`.
+     Import it (AWS), using the converted `lb.key`:
+     ```bash
+     aws acm import-certificate \
+       --certificate fileb://lb.crt \
+       --private-key fileb://lb.key
+     ```
+     The name in the certificate is only a label: the browser/`curl -k` reaches the load balancer by its DNS name and ignores the mismatch.
+     Never commit `lb.key` or `lb.pkcs8.key`.
 3. **Create the load balancer with Terraform**
 
    | Element | AWS | GCP |
@@ -167,6 +186,7 @@ Troubleshooting:
 | `502` / `503` from the LB | No healthy target, or the app is not listening on `0.0.0.0:8080` |
 | Always the same VM | Sticky sessions enabled, or `curl` reuses one connection (try more requests / `--no-keepalive`) |
 | Certificate warning / `curl: (60)` | Self-signed certificate: use `-k` for the lab |
+| ACM import fails (`ValidationException` / invalid private key) | Key is PKCS#8 (`BEGIN PRIVATE KEY`), encrypted, or not RSA 2048: convert with `openssl rsa -traditional` (see step 7.2) |
 
 ### 9. Clean up (mandatory)
 ```bash
